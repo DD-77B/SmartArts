@@ -1,0 +1,97 @@
+name: Build APK «Smart Arts»
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Find and unpack project zip
+        run: |
+          echo "Files in repository:"
+          ls -la
+          ZIP=""
+          if [ -f smartarts-android.zip ]; then ZIP=smartarts-android.zip; fi
+          if [ -z "$ZIP" ]; then ZIP=$(ls -t *.zip 2>/dev/null | head -1); fi
+          if [ -z "$ZIP" ]; then
+            echo "::error::В корне репозитория нет zip-архива с проектом. Загрузите smartarts-android.zip через Add file → Upload files."
+            exit 1
+          fi
+          echo "Using archive: $ZIP"
+          rm -rf build-src && mkdir build-src
+          unzip -q -o "$ZIP" -d build-src
+          SETTINGS=$(find build-src -maxdepth 3 -name settings.gradle | head -1)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::В архиве $ZIP не найден settings.gradle — это не тот архив."
+            find build-src -maxdepth 3 | head -50
+            exit 1
+          fi
+          PROJ=$(dirname "$SETTINGS")
+          echo "Project dir: $PROJ"
+          echo "PROJ=$PROJ" >> $GITHUB_ENV
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK (preinstalled on runner)
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ -z "$SDK" ]; then SDK=/usr/local/lib/android/sdk; fi
+          echo "Android SDK: $SDK"
+          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
+          echo "sdk.dir=$SDK" > "${{ env.PROJ }}/local.properties"
+          SM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          if [ -n "$SM" ]; then
+            yes | "$SM" --licenses > /dev/null 2>&1 || true
+            "$SM" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          fi
+          ls "$SDK/platforms" || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJ }}
+        run: gradle assembleRelease -PversionCode=${{ github.run_number }} --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp ${{ env.PROJ }}/app/build/outputs/apk/release/*.apk out/SmartArts-${{ github.run_number }}.apk
+          ls -la out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartArts-${{ github.run_number }}
+          path: out/*.apk
+
+      - name: Publish release (download from phone)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=build-${{ github.run_number }}-${{ github.run_attempt }}
+          # релиз создаётся сразу вместе с APK одной командой — так GitHub не отказывает при загрузке файла
+          for i in 1 2 3; do
+            if gh release create "$TAG" out/*.apk --repo "${{ github.repository }}" --title "Smart Arts — сборка ${{ github.run_number }}" --notes "APK для установки на телефон" --latest; then
+              echo "Релиз $TAG опубликован"; exit 0
+            fi
+            echo "GitHub не принял релиз, повтор через 20 с…"; sleep 20
+            gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          done
+          echo "::warning::Релиз создать не удалось (сбой на стороне GitHub). APK доступен в разделе Artifacts этого запуска."
